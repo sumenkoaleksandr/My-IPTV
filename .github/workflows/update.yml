@@ -1,0 +1,65 @@
+name: Auto Update IPTV Playlist
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'iptv_parser.py'
+      - '.github/workflows/update.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install aiohttp requests
+
+      - name: Run parser
+        run: python iptv_parser.py
+
+      - name: Validate and push updated playlist
+        run: |
+          if [ ! -s playlist.m3u ]; then
+            echo "Error: playlist.m3u is missing or empty. Aborting."
+            exit 1
+          fi
+
+          if ! head -n 1 playlist.m3u | grep -q "^#EXTM3U"; then
+            echo "Error: Invalid M3U header. Aborting."
+            exit 1
+          fi
+
+          CHANNEL_COUNT=$(grep -c "^#EXTINF" playlist.m3u || true)
+          echo "Validated channels count: $CHANNEL_COUNT"
+          if [ "$CHANNEL_COUNT" -lt 30 ]; then
+            echo "Error: Too few channels ($CHANNEL_COUNT). Keeping old file."
+            exit 1
+          fi
+
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add playlist.m3u
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update playlist ($CHANNEL_COUNT channels)" && git push)
