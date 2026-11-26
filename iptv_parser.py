@@ -5,7 +5,9 @@ import re
 import os
 import sys
 import json
+import time
 from datetime import datetime, timedelta
+from urllib.parse import urljoin
 
 # Базовые самообновляемые источники (без украинских агрегаторов)
 SEED_PLAYLISTS = [
@@ -15,26 +17,41 @@ SEED_PLAYLISTS = [
     "https://myplaylists.github.io/iptv/ru.m3u",
     "https://myplaylists.github.io/iptv/sport.m3u",
     "https://myplaylists.github.io/iptv/cinema.m3u",
+    "https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_russia.m3u8",
+    "https://raw.githubusercontent.com/Dimonchik003/iptv/master/iptv.m3u",
+    "https://raw.githubusercontent.com/SmolNP/IPTVru/main/IPTVru.m3u",
+    "https://raw.githubusercontent.com/ip-tv/iptv/master/ru.m3u",
 ]
 
-# Ссылки на EPG (телепрограмму) и справочник метаданных каналов
 EPG_URLS = "http://epg.it999.ru/epg.xml.gz,https://iptvx.one/epg/epg.xml.gz"
 CHANNELS_DB_URL = "https://iptv-org.github.io/api/channels.json"
+STREAMS_DB_URL = "https://iptv-org.github.io/api/streams.json"
+FEEDS_DB_URL = "https://iptv-org.github.io/api/feeds.json"
 
-# Параметры парсинга и проверки
-DAYS_FRESH = 7              # Искать репозитории на GitHub, обновленные за последние N дней
-MAX_HTTP_CONCURRENT = 50    # Одновременные HTTP-проверки
-HTTP_TIMEOUT = 5            # Таймаут HTTP-ответа (сек)
-FFPROBE_CONCURRENT = 15     # Одновременные проверки видеопотока через ffprobe
-FFPROBE_TIMEOUT = 8         # Таймаут анализа потока через ffprobe (сек)
-MIN_HEIGHT = 480            # Минимальная высота кадра (поставьте 720, чтобы отсеять SD)
-DEDUPLICATE_BY_NAME = True  # Оставлять только одну лучшую версию каждого канала
-MIN_CHANNELS = 30           # Защита: не перезаписывать файл, если рабочих каналов меньше
+# Параметры парсинга и проверки стабильности
+DAYS_FRESH = 14                 # Искать репозитории на GitHub, обновленные за последние N дней
+MAX_HTTP_CONCURRENT = 45        # Одновременные HTTP- и сегмент-проверки
+HTTP_TIMEOUT = 6                # Таймаут HTTP-ответа (сек)
+MAX_LATENCY_SEC = 2.5           # Максимально допустимая задержка ответа сервера (сек)
+MIN_SPEED_KBPS = 1200           # Минимальная скорость отдачи видеосегмента (Кбит/с)
+FFPROBE_CONCURRENT = 15         # Одновременные проверки через ffprobe
+FFPROBE_TIMEOUT = 9             # Таймаут анализа потока через ffprobe (сек)
+MIN_HEIGHT = 480                # Минимальная высота видеокадра (720 — только HD и выше)
+MAX_LATIN_CANDIDATES = 350      # Лимит латинских каналов без тега RU для проверки дорожки в ffprobe
+MAX_MIRRORS_PER_CHANNEL = 2     # Сколько самых стабильных потоков оставлять на каждый канал (1 = без резерва)
+MIN_CHANNELS = 30               # Защита: не перезаписывать файл, если рабочих потоков меньше
 OUTPUT_FILE = "playlist.m3u"
 
 # Поиск сдвига по времени (+1 .. +9) в названии канала
 TIMEZONE_SHIFT_PATTERN = re.compile(
-    r"(?:[\(\[\s]|^)\+([1-9])(?:\s*(?:ч|h|msk|мск))?(?:[\)\]\s]|$)",
+    r"(?:[\(\[\s]\vert{}^)\+([1-9])(?:\s*(?:ч\vert{}h\vert{}msk\vert{}мск))?(?:[\)\]\s]|$)",
+    re.IGNORECASE,
+)
+
+# Признаки привязки потока к конкретному IP-адресу, локальному прокси или одноразовой сессии
+IP_LOCKED_URL_PATTERN = re.compile(
+    r"(^https?://(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.0\.0\.1)|"
+    r"/udpxy/|/udp/|wmsAuthSign=|client_ip=|remote_ip=|user_ip=|ip=\d+\.\d+\.\d+\.\d+)",
     re.IGNORECASE,
 )
 
@@ -42,6 +59,18 @@ TIMEZONE_SHIFT_PATTERN = re.compile(
 ADULT_BLOCK_PATTERN = re.compile(
     r"(18\+|xxx|adult|erotic|эротик|порно|porn|nsfw|brazzers|playboy|hustler|"
     r"penthouse|redlight|private|vivid|babes|nuart|dorcel|venus|sex|секс|клубничка|ночной)",
+    re.IGNORECASE,
+)
+
+# Стоп-слова и домены с жесткой геоблокировкой (отдают заглушку вне РФ или 403/451)
+GEOBLOCK_TEXT_PATTERN = re.compile(
+    r"(geo-?blocked|not\s*24/7|geoblock|region\s*blocked|запрещен\s*в\s*вашем\s*регионе)",
+    re.IGNORECASE,
+)
+GEOBLOCK_DOMAIN_PATTERN = re.compile(
+    r"(vgtrk\.com|smotrim\.ru|1tv\.ru/live|ntv\.ru/air|matchtv\.ru/on-air|"
+    r"ctc\.ru/online|tnt-online\.ru|rutube\.ru/api/play|okko\.tv|wink\.ru/live|"
+    r"kion\.ru|premier\.one|more\.tv|ivi\.ru|kinopoisk\.ru|megogo\.net)",
     re.IGNORECASE,
 )
 
@@ -59,6 +88,33 @@ UKRAINIAN_CHANNELS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Иностранные языковые и региональные маркеры (чешский, польский, немецкий, турецкий и т.д.)
+FOREIGN_LANG_MARKER_PATTERN = re.compile(
+    r"(\b(cz|cze|czech|sk|svk|pl|pol|polish|de|ger|deu|german|fr|fra|french|es|spa|spanish|"
+    r"it|ita|italian|tr|tur|turkish|ro|rou|romanian|bg|bul|hu|hun|rs|srp|hr|hrv|nl|nld|"
+    r"pt|por|ar|ara|hi|hin|ko|kor|ja|jpn|zh|chi|uk|usa|latino|brasil)\b|"
+    r"tvg-id=\"[^\"]*\.(cz|sk|pl|de|fr|es|it|tr|ro|bg|hu|uk|us)\")",
+    re.IGNORECASE,
+)
+
+# Популярные международные бренды для приоритетной проверки русской звуковой дорожки
+LATIN_BRAND_PRIORITY = re.compile(
+    r"\b(discovery|animal\s*planet|national\s*geographic|nat\s*geo|eurosport|viasat|viju|"
+    r"tv\s*1000|tv1000|amedia|nickelodeon|nick\s*jr|cartoon\s*network|boomerang|tiji|gulli|"
+    r"disney|mtv|vh1|mezzo|mcm|bridge|europa\s*plus|setanta|ufc|rt|rbc|ctc|tnt|ntv|ren|mir|sts)\b",
+    re.IGNORECASE,
+)
+
+# Распознавание радиопотоков
+RADIO_PATTERN = re.compile(
+    r"(radio=\"true\"|\b(радио|radio|fm|фм)\b|маяк|вести\s*фм|эхо\s*москвы|авторадио|"
+    r"дорожное|рекорд|record|наше\s*радио|русское\s*радио|европа\s*плюс|dfm|дфм|"
+    r"energy|энерджи|релакс|relax\s*fm|монте-карло|monte\s*carlo|серебряный\s*дождь|"
+    r"бизнес\s*фм|business\s*fm|коммерсантъ\s*фм|детское\s*радио|юмор\s*fm|камеди\s*радио|"
+    r"like\s*fm|лайк\s*фм|маруся\s*фм|казак\s*фм|милицейская\s*волна|радио\s*дача|радио\s*шансон)",
+    re.IGNORECASE,
+)
+
 # Порядок отображения групп в итоговом плейлисте
 CATEGORY_ORDER = {
     "Общероссийские": 0,
@@ -70,7 +126,8 @@ CATEGORY_ORDER = {
     "Новости": 6,
     "Музыка": 7,
     "Часовые пояса": 8,
-    "Общие": 9,
+    "Радио": 9,
+    "Общие": 10,
 }
 
 # Ручной порядок главных каналов внутри категорий
@@ -309,13 +366,11 @@ CATEGORY_RULES = [
 
 
 def extract_timezone_shift(raw_title):
-    """Возвращает номер часового сдвига (1..9) или 0, если это основной пояс."""
     match = TIMEZONE_SHIFT_PATTERN.search(raw_title)
     return int(match.group(1)) if match else 0
 
 
 def normalize_channel_name(name, keep_shift=False):
-    """Очищает название канала от тегов качества и региона."""
     shift = extract_timezone_shift(name)
     clean = name.lower()
     clean = re.sub(r"[\(\[].*?[\)\]]", "", clean)
@@ -327,10 +382,29 @@ def normalize_channel_name(name, keep_shift=False):
     return clean
 
 
-def load_channels_metadata():
-    """Загружает базу логотипов, tvg-id, категорий, страны и флага is_nsfw из iptv-org."""
-    print("[*] Загрузка справочника метаданных iptv-org...")
+def is_ip_independent_url(stream_url):
+    """Проверяет, что ссылка не привязана к конкретному IP или локальному прокси."""
+    return not bool(IP_LOCKED_URL_PATTERN.search(stream_url))
+
+
+def load_iptv_org_databases():
+    """Загружает справочник каналов, языки фидов и список геоблокировок из iptv-org."""
+    print("[*] Загрузка баз метаданных, языков и геоблокировок iptv-org...")
     metadata_map = {}
+    geoblocked_urls = set()
+    channel_languages = {}
+
+    try:
+        f_resp = requests.get(FEEDS_DB_URL, timeout=15)
+        if f_resp.status_code == 200:
+            for feed in f_resp.json():
+                ch_id = feed.get("channel") or ""
+                langs = [l.lower() for l in (feed.get("languages") or [])]
+                if ch_id and langs:
+                    channel_languages.setdefault(ch_id, set()).update(langs)
+    except Exception as e:
+        print(f"[!] Ошибка загрузки feeds.json: {e}")
+
     try:
         resp = requests.get(CHANNELS_DB_URL, timeout=15)
         if resp.status_code == 200:
@@ -340,6 +414,7 @@ def load_channels_metadata():
                 country = (ch.get("country") or "").upper()
                 is_nsfw = bool(ch.get("is_nsfw", False))
                 categories = ch.get("categories") or []
+                langs = channel_languages.get(ch_id, set())
 
                 names_to_index = [ch.get("name", "")] + (ch.get("alt_names") or [])
                 for raw_name in names_to_index:
@@ -353,314 +428,15 @@ def load_channels_metadata():
                             "country": country,
                             "is_nsfw": is_nsfw,
                             "categories": categories,
+                            "languages": langs,
                         }
-        print(f"[+] Загружено записей в справочник метаданных: {len(metadata_map)}")
     except Exception as e:
-        print(f"[!] Не удалось загрузить базу метаданных: {e}")
-    return metadata_map
+        print(f"[!] Ошибка загрузки channels.json: {e}")
 
-
-def is_allowed_channel(extinf_line, stream_url, meta):
-    """Проверяет, что канал русскоязычный, не 18+ и не украинский."""
-    title_part = extinf_line.split(",")[-1].strip()
-
-    if meta.get("is_nsfw"):
-        return False
-    if ADULT_BLOCK_PATTERN.search(extinf_line) or ADULT_BLOCK_PATTERN.search(stream_url):
-        return False
-
-    if meta.get("country") == "UA":
-        return False
-    if UKRAINIAN_LETTERS_PATTERN.search(extinf_line):
-        return False
-    if UKRAINIAN_TAG_PATTERN.search(extinf_line) or UKRAINIAN_TAG_PATTERN.search(stream_url):
-        return False
-    if UKRAINIAN_CHANNELS_PATTERN.search(title_part):
-        return False
-
-    has_cyrillic = bool(re.search(r"[а-яА-ЯёЁ]", title_part))
-    has_ru_tag = bool(re.search(r"\b(ru|rus|russia|россия)\b", extinf_line, re.IGNORECASE))
-    is_ru_country = meta.get("country") == "RU"
-
-    return has_cyrillic or has_ru_tag or is_ru_country
-
-
-def detect_category(extinf_line, meta):
-    """Строгое определение категории: Часовые пояса -> Общероссийские -> iptv-org -> правила."""
-    raw_title = extinf_line.split(",")[-1].strip()
-    shift = extract_timezone_shift(raw_title)
-
-    if shift > 0:
-        return "Часовые пояса"
-
-    base_norm_title = normalize_channel_name(raw_title, keep_shift=False)
-
-    if base_norm_title in CATEGORY_CHANNEL_ORDER["Общероссийские"]:
-        return "Общероссийские"
-
-    for raw_cat in meta.get("categories", []):
-        mapped = IPTV_ORG_CATEGORY_MAP.get(raw_cat.lower())
-        if mapped:
-            return mapped
-
-    group_match = re.search(r'group-title="([^"]+)"', extinf_line, re.IGNORECASE)
-    existing_group = group_match.group(1).strip().lower() if group_match else ""
-    title_part = raw_title.lower()
-
-    for category, pattern in CATEGORY_RULES:
-        if re.search(pattern, title_part, re.IGNORECASE) or re.search(pattern, existing_group, re.IGNORECASE):
-            return category
-
-    return "Общие"
-
-
-def enrich_extinf(extinf_line, category, meta):
-    """Формирует итоговую строку #EXTINF с категорией, логотипом и tvg-id."""
-    header_part, _, channel_title = extinf_line.partition(",")
-    channel_title = channel_title.strip()
-
-    existing_attrs = dict(re.findall(r'([a-zA-Z0-9_-]+)="([^"]*)"', header_part))
-    existing_attrs["group-title"] = category
-
-    if not existing_attrs.get("tvg-id") and meta.get("tvg-id"):
-        existing_attrs["tvg-id"] = meta["tvg-id"]
-    if not existing_attrs.get("tvg-logo") and meta.get("tvg-logo"):
-        existing_attrs["tvg-logo"] = meta["tvg-logo"]
-
-    duration_match = re.match(r"^(#EXTINF:[^\s,]+)", header_part)
-    duration_prefix = duration_match.group(1) if duration_match else "#EXTINF:-1"
-
-    attrs_str = " ".join(f'{k}="{v}"' for k, v in existing_attrs.items() if v)
-    return f"{duration_prefix} {attrs_str},{channel_title}"
-
-
-def search_fresh_github_playlists(days=7):
-    """Ищет свежие плейлисты на GitHub через Search API."""
-    print(f"[*] Поиск свежих плейлистов на GitHub (за последние {days} дн.)...")
-    date_since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d')
-    url = f"https://api.github.com/search/repositories?q=iptv+m3u+pushed:>{date_since}&sort=updated&order=desc&per_page=30"
-    headers = {"Accept": "application/vnd.github.v3+json"}
-
-    found_urls = set(SEED_PLAYLISTS)
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            for repo in resp.json().get("items", []):
-                full_name = repo["full_name"]
-                default_branch = repo["default_branch"]
-                tree_url = f"https://api.github.com/repos/{full_name}/git/trees/{default_branch}?recursive=1"
-                tree_resp = requests.get(tree_url, headers=headers, timeout=10)
-                if tree_resp.status_code == 200:
-                    for file_info in tree_resp.json().get("tree", []):
-                        path = file_info.get("path", "")
-                        if path.endswith((".m3u", ".m3u8")):
-                            found_urls.add(f"https://raw.githubusercontent.com/{full_name}/{default_branch}/{path}")
-    except Exception as e:
-        print(f"[!] Ошибка при поиске на GitHub: {e}")
-
-    print(f"[+] Найдено источников для проверки: {len(found_urls)}")
-    return list(found_urls)
-
-
-async def fetch_playlist_content(session, url, metadata_map):
-    """Скачивает плейлист, применяет строгие фильтры и классифицирует каналы."""
-    channels = []
-    try:
-        async with session.get(url, timeout=10) as resp:
-            if resp.status == 200:
-                text = await resp.text(errors="ignore")
-                lines = [line.strip() for line in text.splitlines() if line.strip()]
-
-                current_extinf = None
-                for line in lines:
-                    if line.startswith("#EXTINF"):
-                        current_extinf = line
-                    elif line.startswith("http") and current_extinf:
-                        title_part = current_extinf.split(",")[-1].strip()
-                        base_norm = normalize_channel_name(title_part, keep_shift=False)
-                        unique_norm = normalize_channel_name(title_part, keep_shift=True)
-                        meta = metadata_map.get(base_norm, {})
-
-                        if is_allowed_channel(current_extinf, line, meta):
-                            category = detect_category(current_extinf, meta)
-                            enriched_extinf = enrich_extinf(current_extinf, category, meta)
-                            channels.append((category, enriched_extinf, line, unique_norm))
-                        current_extinf = None
-    except Exception:
-        pass
-    return channels
-
-
-async def check_stream_alive(session, semaphore, category, extinf, stream_url, norm_name):
-    """Этап 1: Быстрая HTTP-проверка доступности потока."""
-    async with semaphore:
-        try:
-            async with session.get(stream_url, timeout=HTTP_TIMEOUT, allow_redirects=True) as resp:
-                if resp.status == 200:
-                    chunk = await resp.content.read(128)
-                    if chunk:
-                        return (category, extinf, stream_url, norm_name)
-        except Exception:
-            pass
-    return None
-
-
-def classify_resolution(height):
-    if height >= 2160:
-        return "4K"
-    elif height >= 1080:
-        return "FHD"
-    elif height >= 720:
-        return "HD"
-    return "SD"
-
-
-async def probe_stream_quality(semaphore, category, extinf, stream_url, norm_name):
-    """Этап 2: Проверка реального видеопотока и разрешения через ffprobe."""
-    async with semaphore:
-        cmd = [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_streams",
-            "-select_streams", "v:0",
-            "-user_agent", "VLC/3.0.18 LibVLC/3.0.18",
-            "-rw_timeout", str(FFPROBE_TIMEOUT * 1_000_000),
-            stream_url,
-        ]
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FFPROBE_TIMEOUT + 2)
-
-            if proc.returncode != 0 or not stdout:
-                return None
-
-            data = json.loads(stdout.decode("utf-8", errors="ignore"))
-            streams = data.get("streams", [])
-            if not streams:
-                return None
-
-            height = int(streams[0].get("height", 0))
-            if height < MIN_HEIGHT:
-                return None
-
-            quality_tag = classify_resolution(height)
-            header, _, title = extinf.partition(",")
-            title = title.strip()
-            title = re.sub(r"\s*\[(4K|FHD|HD|SD)\]", "", title, flags=re.IGNORECASE).strip()
-            title = f"{title} [{quality_tag}]"
-
-            updated_extinf = f"{header},{title}"
-            return (category, updated_extinf, stream_url, norm_name, height)
-
-        except Exception:
-            if proc:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            return None
-
-
-async def main():
-    metadata_map = load_channels_metadata()
-    playlist_urls = search_fresh_github_playlists(days=DAYS_FRESH)
-
-    connector = aiohttp.TCPConnector(limit=MAX_HTTP_CONCURRENT, ssl=False)
-    headers = {"User-Agent": "VLC/3.0.18 LibVLC/3.0.18"}
-
-    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
-        print("[*] Скачивание и фильтрация плейлистов...")
-        fetch_tasks = [fetch_playlist_content(session, url, metadata_map) for url in playlist_urls]
-        results = await asyncio.gather(*fetch_tasks)
-
-        unique_urls = {}
-        for channel_list in results:
-            for category, extinf, stream_url, norm_name in channel_list:
-                if stream_url not in unique_urls:
-                    unique_urls[stream_url] = (category, extinf, norm_name)
-
-        print(f"[+] Отобрано уникальных ссылок после фильтрации: {len(unique_urls)}")
-        if not unique_urls:
-            print("[-] Каналы не найдены. Завершение.")
-            sys.exit(1)
-
-        print("[*] Этап 1: Проверка HTTP-доступности потоков...")
-        http_semaphore = asyncio.Semaphore(MAX_HTTP_CONCURRENT)
-        http_tasks = [
-            check_stream_alive(session, http_semaphore, cat, ext, url, norm)
-            for url, (cat, ext, norm) in unique_urls.items()
-        ]
-
-        alive_streams = []
-        for future in asyncio.as_completed(http_tasks):
-            res = await future
-            if res:
-                alive_streams.append(res)
-
-        print(f"[+] Прошли HTTP-проверку: {len(alive_streams)} потоков.")
-
-    print("[*] Этап 2: Анализ разрешения видео через ffprobe...")
-    probe_semaphore = asyncio.Semaphore(FFPROBE_CONCURRENT)
-    probe_tasks = [
-        probe_stream_quality(probe_semaphore, cat, ext, url, norm)
-        for cat, ext, url, norm in alive_streams
-    ]
-
-    verified_channels = []
-    for future in asyncio.as_completed(probe_tasks):
-        res = await future
-        if res:
-            verified_channels.append(res)
-            if len(verified_channels) % 25 == 0:
-                print(f"    Подтверждено видеопотоков: {len(verified_channels)}...")
-
-    if DEDUPLICATE_BY_NAME:
-        best_channels = {}
-        for item in verified_channels:
-            cat, ext, url, norm, height = item
-            key = norm if norm else url
-            if key not in best_channels or height > best_channels[key][4]:
-                best_channels[key] = item
-        final_channels = list(best_channels.values())
-    else:
-        final_channels = verified_channels
-
-    if len(final_channels) < MIN_CHANNELS:
-        print(f"[-] Слишком мало рабочих каналов ({len(final_channels)} < {MIN_CHANNELS}). Старый файл сохранен.")
-        sys.exit(1)
-
-    def channel_sort_key(item):
-        cat, extinf, url, norm_name, height = item
-        cat_rank = CATEGORY_ORDER.get(cat, 99)
-        raw_title = extinf.split(",")[-1].strip()
-        base_name = normalize_channel_name(raw_title, keep_shift=False)
-        shift = extract_timezone_shift(raw_title)
-
-        if cat == "Часовые пояса":
-            channel_rank = CATEGORY_CHANNEL_ORDER["Общероссийские"].get(base_name, 999)
-            return (cat_rank, channel_rank, shift, raw_title.lower())
-
-        cat_order_map = CATEGORY_CHANNEL_ORDER.get(cat, {})
-        channel_rank = cat_order_map.get(base_name, 999)
-        return (cat_rank, channel_rank, 0, raw_title.lower())
-
-    final_channels.sort(key=channel_sort_key)
-
-    temp_file = f"{OUTPUT_FILE}.tmp"
-    with open(temp_file, "w", encoding="utf-8") as f:
-        f.write(f'#EXTM3U url-tvg="{EPG_URLS}" x-tvg-url="{EPG_URLS}"\n')
-        for _, extinf, stream_url, _, _ in final_channels:
-            f.write(f"{extinf}\n{stream_url}\n")
-
-    os.replace(temp_file, OUTPUT_FILE)
-    print(f"[+] Готово! В плейлист сохранено {len(final_channels)} каналов.")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        s_resp = requests.get(STREAMS_DB_URL, timeout=15)
+        if s_resp.status_code == 200:
+            for st in s_resp.json():
+                status = (st.get("status") or "").lower()
+                title = (st.get("title") or "").lower()
+                url
