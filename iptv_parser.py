@@ -62,7 +62,7 @@ ADULT_BLOCK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Стоп-слова и домены с жесткой геоблокировкой (отдают заглушку вне РФ или 403/451)
+# Стоп-слова и домены с жесткой геоблокировкой
 GEOBLOCK_TEXT_PATTERN = re.compile(
     r"(geo-?blocked|not\s*24/7|geoblock|region\s*blocked|запрещен\s*в\s*вашем\s*регионе)",
     re.IGNORECASE,
@@ -88,7 +88,7 @@ UKRAINIAN_CHANNELS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Иностранные языковые и региональные маркеры (чешский, польский, немецкий, турецкий и т.д.)
+# Иностранные языковые и региональные маркеры
 FOREIGN_LANG_MARKER_PATTERN = re.compile(
     r"(\b(cz|cze|czech|sk|svk|pl|pol|polish|de|ger|deu|german|fr|fra|french|es|spa|spanish|"
     r"it|ita|italian|tr|tur|turkish|ro|rou|romanian|bg|bul|hu|hun|rs|srp|hr|hrv|nl|nld|"
@@ -342,101 +342,4 @@ CATEGORY_RULES = [
     ),
     (
         "Познавательные",
-        r"(discovery|дискавери|animal|history|история|наука|national geographic|nat geo|природа|охота|рыбалка|"
-        r"путешествия|моя планета|живая планета|эврика|galaxy|гэлакси|365 дней|кто есть кто|время|ностальгия|"
-        r"усадьба|загородный|бобер|бобёр|кухня|еда|телекафе|доктор|здоровье|живи|психология|оружие|техно 24|"
-        r"т24|nanо|нано|ocean|океан|в мире животных|диалоги о рыбалке|дикий|zoo|зоо|documentary|science|travel)",
-    ),
-    (
-        "Музыка",
-        r"(муз|music|mtv|ru\.tv|ru tv|жара|шансон|bridge|бридж|europa plus|европа плюс|хит|тнт music|"
-        r"ля-минор|ля минор|russian musicbox|music box|mcm|mezzo|классика|vh1|1hd music)",
-    ),
-    (
-        "Новости",
-        r"(новост|news|россия 24|рбк|rbc|мир 24|известия|рен тв|рен-тв|звезда|rt\b|russia today|"
-        r"москва 24|360|соловьев|вместе-рф|дума тв|инфо|24)",
-    ),
-    (
-        "Развлекательные",
-        r"(стс|тнт|пятница|суббота|че\b|ю\b|тв-3|тв3|перец|2x2|2х2|квн|сарафан|аншлаг|юмор|"
-        r"комеди|comedy|развлек|шоу|entertainment|калейдоскоп|точка тв|мир сериала|супер)",
-    ),
-]
-
-
-def extract_timezone_shift(raw_title):
-    match = TIMEZONE_SHIFT_PATTERN.search(raw_title)
-    return int(match.group(1)) if match else 0
-
-
-def normalize_channel_name(name, keep_shift=False):
-    shift = extract_timezone_shift(name)
-    clean = name.lower()
-    clean = re.sub(r"[\(\[].*?[\)\]]", "", clean)
-    clean = re.sub(r"\b(hd|fhd|uhd|4k|sd|hq|ru|rus|tv|тв|плюс|\+\d)\b", "", clean)
-    clean = re.sub(r"[^a-zа-яё0-9]", "", clean).strip()
-
-    if keep_shift and shift > 0 and clean:
-        return f"{clean}_plus{shift}"
-    return clean
-
-
-def is_ip_independent_url(stream_url):
-    """Проверяет, что ссылка не привязана к конкретному IP или локальному прокси."""
-    return not bool(IP_LOCKED_URL_PATTERN.search(stream_url))
-
-
-def load_iptv_org_databases():
-    """Загружает справочник каналов, языки фидов и список геоблокировок из iptv-org."""
-    print("[*] Загрузка баз метаданных, языков и геоблокировок iptv-org...")
-    metadata_map = {}
-    geoblocked_urls = set()
-    channel_languages = {}
-
-    try:
-        f_resp = requests.get(FEEDS_DB_URL, timeout=15)
-        if f_resp.status_code == 200:
-            for feed in f_resp.json():
-                ch_id = feed.get("channel") or ""
-                langs = [l.lower() for l in (feed.get("languages") or [])]
-                if ch_id and langs:
-                    channel_languages.setdefault(ch_id, set()).update(langs)
-    except Exception as e:
-        print(f"[!] Ошибка загрузки feeds.json: {e}")
-
-    try:
-        resp = requests.get(CHANNELS_DB_URL, timeout=15)
-        if resp.status_code == 200:
-            for ch in resp.json():
-                ch_id = ch.get("id", "")
-                logo = ch.get("logo", "")
-                country = (ch.get("country") or "").upper()
-                is_nsfw = bool(ch.get("is_nsfw", False))
-                categories = ch.get("categories") or []
-                langs = channel_languages.get(ch_id, set())
-
-                names_to_index = [ch.get("name", "")] + (ch.get("alt_names") or [])
-                for raw_name in names_to_index:
-                    norm = normalize_channel_name(raw_name, keep_shift=False)
-                    if not norm:
-                        continue
-                    if norm not in metadata_map or (country == "RU" and metadata_map[norm]["country"] != "RU"):
-                        metadata_map[norm] = {
-                            "tvg-id": ch_id,
-                            "tvg-logo": logo,
-                            "country": country,
-                            "is_nsfw": is_nsfw,
-                            "categories": categories,
-                            "languages": langs,
-                        }
-    except Exception as e:
-        print(f"[!] Ошибка загрузки channels.json: {e}")
-
-    try:
-        s_resp = requests.get(STREAMS_DB_URL, timeout=15)
-        if s_resp.status_code == 200:
-            for st in s_resp.json():
-                status = (st.get("status") or "").lower()
-                title = (st.get("title") or "").lower()
-                url
+        r"(discovery|дискавери|animal|history|история|наука|national geographic|nat geo|природа|охота
