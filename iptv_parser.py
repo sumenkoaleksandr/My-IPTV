@@ -9,9 +9,12 @@ import time
 from datetime import datetime, timedelta
 from urllib.parse import urljoin
 
+# Базовые самообновляемые источники (без украинских агрегаторов)
 SEED_PLAYLISTS = [
     "https://iptv-org.github.io/iptv/languages/rus.m3u",
     "https://iptv-org.github.io/iptv/countries/ru.m3u",
+    "https://ngrch.github.io/iptv/ru.m3u",
+    "https://raw.githubusercontent.com/Adam-ZS/iptv-ru-ua/main/iptv.m3u",
     "https://raw.githubusercontent.com/slava-67/TV/IPTV/iptv.m3u",
     "https://myplaylists.github.io/iptv/ru.m3u",
     "https://myplaylists.github.io/iptv/sport.m3u",
@@ -27,36 +30,42 @@ CHANNELS_DB_URL = "https://iptv-org.github.io/api/channels.json"
 STREAMS_DB_URL = "https://iptv-org.github.io/api/streams.json"
 FEEDS_DB_URL = "https://iptv-org.github.io/api/feeds.json"
 
-DAYS_FRESH = 30
-MAX_HTTP_CONCURRENT = 45
-HTTP_TIMEOUT = 8
-MAX_LATENCY_SEC = 4.5
-MIN_SPEED_KBPS = 500
-FFPROBE_CONCURRENT = 15
-FFPROBE_TIMEOUT = 10
-MIN_HEIGHT = 360
-MAX_LATIN_CANDIDATES = 350
-MAX_MIRRORS_PER_CHANNEL = 2
-MIN_CHANNELS = 15
+# Параметры парсинга и проверки стабильности
+DAYS_FRESH = 30                 # Искать репозитории на GitHub, обновленные за последние N дней
+MAX_HTTP_CONCURRENT = 45        # Одновременные HTTP- и сегмент-проверки
+HTTP_TIMEOUT = 8                # Таймаут HTTP-ответа (сек)
+MAX_LATENCY_SEC = 4.5           # Максимально допустимая задержка ответа сервера (сек)
+MIN_SPEED_KBPS = 500            # Минимальная скорость отдачи видеосегмента (Кбит/с)
+FFPROBE_CONCURRENT = 15         # Одновременные проверки через ffprobe
+FFPROBE_TIMEOUT = 10            # Таймаут анализа потока через ffprobe (сек)
+MIN_HEIGHT = 360                # Минимальная высота видеокадра (720 — только HD и выше)
+MAX_LATIN_CANDIDATES = 350      # Лимит латинских каналов без тега RU для проверки дорожки в ffprobe
+MAX_MIRRORS_PER_CHANNEL = 3     # Сколько самых стабильных потоков оставлять на каждый канал (1 = без резерва)
+MIN_CHANNELS = 15               # Защита: не перезаписывать файл, если рабочих потоков меньше
 OUTPUT_FILE = "playlist.m3u"
+CUSTOM_PLAYLIST_FILE = "custom_channels.m3u"
 
+# Поиск сдвига по времени (+1 .. +9) в названии канала
 TIMEZONE_SHIFT_PATTERN = re.compile(
     r"(?:[\(\[\s]|^)\+([1-9])(?:\s*(?:ч|h|msk|мск))?(?:[\)\]\s]|$)",
     re.IGNORECASE,
 )
 
+# Признаки привязки потока к конкретному IP-адресу, локальному прокси или одноразовой сессии
 IP_LOCKED_URL_PATTERN = re.compile(
     r"(^https?://(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.0\.0\.1)|"
     r"/udpxy/|/udp/|wmsAuthSign=|client_ip=|remote_ip=|user_ip=|ip=\d+\.\d+\.\d+\.\d+)",
     re.IGNORECASE,
 )
 
+# Стоп-слова для жесткого отсева 18+
 ADULT_BLOCK_PATTERN = re.compile(
     r"(18\+|xxx|adult|erotic|эротик|порно|porn|nsfw|brazzers|playboy|hustler|"
     r"penthouse|redlight|private|vivid|babes|nuart|dorcel|venus|sex|секс|клубничка|ночной)",
     re.IGNORECASE,
 )
 
+# Стоп-слова и домены с жесткой геоблокировкой
 GEOBLOCK_TEXT_PATTERN = re.compile(
     r"(geo-?blocked|not\s*24/7|geoblock|region\s*blocked|запрещен\s*в\s*вашем\s*регионе)",
     re.IGNORECASE,
@@ -68,6 +77,7 @@ GEOBLOCK_DOMAIN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Стоп-слова и паттерны для отсева украинских каналов
 UKRAINIAN_LETTERS_PATTERN = re.compile(r"[іїєґІЇЄҐ]")
 UKRAINIAN_TAG_PATTERN = re.compile(
     r"(\b(ua|ukr|ukraine|украина|україна)\b|\.ua\b|tvg-id=\"[^\"]*\.ua\")",
@@ -81,6 +91,7 @@ UKRAINIAN_CHANNELS_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Иностранные языковые и региональные маркеры
 FOREIGN_LANG_MARKER_PATTERN = re.compile(
     r"(\b(cz|cze|czech|sk|svk|pl|pol|polish|de|ger|deu|german|fr|fra|french|es|spa|spanish|"
     r"it|ita|italian|tr|tur|turkish|ro|rou|romanian|bg|bul|hu|hun|rs|srp|hr|hrv|nl|nld|"
@@ -89,6 +100,7 @@ FOREIGN_LANG_MARKER_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Популярные международные бренды для приоритетной проверки русской звуковой дорожки
 LATIN_BRAND_PRIORITY = re.compile(
     r"\b(discovery|animal\s*planet|national\s*geographic|nat\s*geo|eurosport|viasat|viju|"
     r"tv\s*1000|tv1000|amedia|nickelodeon|nick\s*jr|cartoon\s*network|boomerang|tiji|gulli|"
@@ -96,6 +108,7 @@ LATIN_BRAND_PRIORITY = re.compile(
     re.IGNORECASE,
 )
 
+# Распознавание радиопотоков
 RADIO_PATTERN = re.compile(
     r"(radio=\"true\"|\b(радио|radio|fm|фм)\b|маяк|вести\s*фм|эхо\s*москвы|авторадио|"
     r"дорожное|рекорд|record|наше\s*радио|русское\s*радио|европа\s*плюс|dfm|дфм|"
@@ -424,6 +437,41 @@ def enrich_extinf(extinf_line, category, meta):
     return f"{duration_prefix} {attrs_str},{channel_title}"
 
 
+def load_custom_channels(filepath, metadata_map):
+    """Читает личный плейлист custom_channels.m3u без проверки с IP GitHub."""
+    if not os.path.exists(filepath):
+        print(f"[*] Локальный файл {filepath} не найден, пропуск.")
+        return []
+
+    print(f"[*] Загрузка пользовательских каналов из {filepath}...")
+    custom_items = []
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+
+        current_extinf = None
+        for line in lines:
+            if line.startswith("#EXTINF"):
+                current_extinf = line
+            elif line.startswith(("http://", "https://")) and current_extinf:
+                raw_title = current_extinf.split(",")[-1].strip()
+                base_norm = normalize_channel_name(raw_title, keep_shift=False)
+                unique_norm = normalize_channel_name(raw_title, keep_shift=True)
+                meta = metadata_map.get(base_norm, {})
+
+                group_match = re.search(r'group-title="([^"]+)"', current_extinf, re.IGNORECASE)
+                category = group_match.group(1).strip() if group_match else "Общероссийские"
+
+                enriched_extinf = enrich_extinf(current_extinf, category, meta)
+                custom_items.append((category, enriched_extinf, line, unique_norm, 1080, False, 999999))
+                current_extinf = None
+    except Exception as e:
+        print(f"[!] Ошибка чтения {filepath}: {e}")
+
+    print(f"[+] Загружено пользовательских каналов: {len(custom_items)}")
+    return custom_items
+
+
 def search_fresh_github_playlists(days=30):
     print(f"[*] Поиск свежих плейлистов на GitHub (за последние {days} дн.)...")
     date_since = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d')
@@ -487,8 +535,12 @@ async def fetch_playlist_content(session, url, metadata_map, geoblocked_urls):
     return channels
 
 
-async def test_stream_stability(session, stream_url, is_radio=False):
+async def test_stream_stability(session, stream_url, is_radio=False, is_federal=False):
     start_time = time.monotonic()
+    req_min_speed = 900 if is_federal else MIN_SPEED_KBPS
+    req_max_latency = 2.5 if is_federal else MAX_LATENCY_SEC
+    segments_to_test = 3 if is_federal else 1
+
     try:
         async with session.get(stream_url, timeout=HTTP_TIMEOUT, allow_redirects=True) as resp:
             if resp.status != 200:
@@ -501,7 +553,7 @@ async def test_stream_stability(session, stream_url, is_radio=False):
                 return 0
 
             latency = time.monotonic() - start_time
-            if latency > MAX_LATENCY_SEC:
+            if latency > req_max_latency:
                 return 0
 
             content_type = (resp.headers.get("Content-Type") or "").lower()
@@ -534,7 +586,8 @@ async def test_stream_stability(session, stream_url, is_radio=False):
 
                 if sub_playlists:
                     sub_playlists.sort(key=lambda x: x[0], reverse=True)
-                    async with session.get(sub_playlists[0][1], timeout=HTTP_TIMEOUT) as sub_resp:
+                    target_sub = sub_playlists[1][1] if (is_federal and len(sub_playlists) > 1) else sub_playlists[0][1]
+                    async with session.get(target_sub, timeout=HTTP_TIMEOUT) as sub_resp:
                         if sub_resp.status != 200:
                             return 0
                         sub_text = await sub_resp.text(errors="ignore")
@@ -548,27 +601,31 @@ async def test_stream_stability(session, stream_url, is_radio=False):
                 if not segments:
                     return 0
 
-                seg_start = time.monotonic()
-                async with session.get(segments[0], timeout=HTTP_TIMEOUT) as seg_resp:
-                    if seg_resp.status != 200:
-                        return 0
-                    seg_data = await seg_resp.content.read(524288)
-                    seg_elapsed = max(time.monotonic() - seg_start, 0.01)
+                total_bytes = 0
+                total_time = 0.0
+                for seg_url in segments[:segments_to_test]:
+                    seg_start = time.monotonic()
+                    async with session.get(seg_url, timeout=HTTP_TIMEOUT) as seg_resp:
+                        if seg_resp.status != 200:
+                            return 0
+                        seg_data = await seg_resp.content.read(524288)
+                        seg_elapsed = max(time.monotonic() - seg_start, 0.01)
+                        if len(seg_data) < 8192:
+                            return 0
+                        total_bytes += len(seg_data)
+                        total_time += seg_elapsed
 
-                    if len(seg_data) < 8192:
-                        return 0
+                speed_kbps = (total_bytes * 8 / 1000) / max(total_time, 0.01)
+                if speed_kbps < req_min_speed:
+                    return 0
 
-                    speed_kbps = (len(seg_data) * 8 / 1000) / seg_elapsed
-                    if speed_kbps < MIN_SPEED_KBPS:
-                        return 0
-
-                    return max(int(speed_kbps - (latency * 250)), 1)
+                return max(int(speed_kbps - (latency * 300)), 1)
 
             elapsed = max(time.monotonic() - start_time, 0.01)
             speed_kbps = (len(raw_bytes) * 8 / 1000) / elapsed
-            if speed_kbps < MIN_SPEED_KBPS:
+            if speed_kbps < req_min_speed:
                 return 0
-            return max(int(speed_kbps - (latency * 250)), 1)
+            return max(int(speed_kbps - (latency * 300)), 1)
 
     except Exception:
         return 0
@@ -577,7 +634,8 @@ async def test_stream_stability(session, stream_url, is_radio=False):
 async def check_stream_alive(session, semaphore, category, extinf, stream_url, norm_name, require_rus_audio):
     async with semaphore:
         is_radio = (category == "Радио")
-        score = await test_stream_stability(session, stream_url, is_radio=is_radio)
+        is_federal = (category == "Общероссийские")
+        score = await test_stream_stability(session, stream_url, is_radio=is_radio, is_federal=is_federal)
         if score > 0:
             return (category, extinf, stream_url, norm_name, require_rus_audio, score)
     return None
@@ -716,22 +774,19 @@ async def main():
                 confirmed_urls[url] = (cat, ext, norm, req_audio)
 
         print(f"[+] Отобрано уникальных ссылок для проверки стабильности: {len(confirmed_urls)}")
-        if not confirmed_urls:
-            print("[-] Каналы не найдены. Завершение.")
-            sys.exit(1)
-
-        print("[*] Этап 1: Замер задержки, скорости сегментов и проверка IP-независимости...")
-        http_semaphore = asyncio.Semaphore(MAX_HTTP_CONCURRENT)
-        http_tasks = [
-            check_stream_alive(session, http_semaphore, cat, ext, url, norm, req_audio)
-            for url, (cat, ext, norm, req_audio) in confirmed_urls.items()
-        ]
 
         alive_streams = []
-        for future in asyncio.as_completed(http_tasks):
-            res = await future
-            if res:
-                alive_streams.append(res)
+        if confirmed_urls:
+            print("[*] Этап 1: Замер задержки, скорости сегментов и проверка IP-независимости...")
+            http_semaphore = asyncio.Semaphore(MAX_HTTP_CONCURRENT)
+            http_tasks = [
+                check_stream_alive(session, http_semaphore, cat, ext, url, norm, req_audio)
+                for url, (cat, ext, norm, req_audio) in confirmed_urls.items()
+            ]
+            for future in asyncio.as_completed(http_tasks):
+                res = await future
+                if res:
+                    alive_streams.append(res)
 
         print(f"[+] Прошли тест скорости и стабильности: {len(alive_streams)} потоков.")
 
@@ -749,6 +804,10 @@ async def main():
             verified_channels.append(res)
             if len(verified_channels) % 25 == 0:
                 print(f"    Подтверждено потоков: {len(verified_channels)}...")
+
+    # Подключаем пользовательские ссылки из custom_channels.m3u с максимальным приоритетом
+    custom_channels = load_custom_channels(CUSTOM_PLAYLIST_FILE, metadata_map)
+    verified_channels.extend(custom_channels)
 
     grouped_by_channel = {}
     for item in verified_channels:
